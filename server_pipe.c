@@ -112,15 +112,37 @@ __global__ void bgr_to_surface_and_nchw(
     //     printf("BGR = %d %d %d\n", b,g,r);
 
     // Write RGBA8 (OpenGL)
-    uchar4 out = make_uchar4(r, g, b, 255);
+    //uchar4 out = make_uchar4(r, g, b, 255);
     //uchar4 out = make_uchar4(255, 0, 0, 255); // DEBUG
-    surf2Dwrite(out, surf, x * sizeof(uchar4), (H - 1 - y));
+    //surf2Dwrite(out, surf, x * sizeof(uchar4), (H - 1 - y));
 
     // TensorRT NCHW normalized
     float s = 1.0f / 255.0f;
     nchw[idx]            = r * s;
     nchw[pixels + idx]   = g * s;
     nchw[2*pixels + idx] = b * s;
+}
+
+__global__ void nchw_to_surface(
+    const float* __restrict__ nchw,
+    cudaSurfaceObject_t surf,
+    int W, int H, int pixels)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+
+    int idx = y * W + x;
+    
+    // Read NCHW float channels and denormalize (0.0-1.0 -> 0-255)
+    // Note: This matches the 'Sigmoid' output of your PyTorch Net
+    unsigned char r = (unsigned char)(nchw[idx]            * 255.0f);
+    unsigned char g = (unsigned char)(nchw[pixels + idx]   * 255.0f);
+    unsigned char b = (unsigned char)(nchw[2*pixels + idx] * 255.0f);
+
+    // Write back to the OpenGL surface (using the same flip logic as your BGR kernel)
+    uchar4 out = make_uchar4(r, g, b, 255);
+    surf2Dwrite(out, surf, x * sizeof(uchar4), (H - 1 - y));
 }
 
 
@@ -377,6 +399,10 @@ int server_process_frame(unsigned char* host_frame, int size)
 {
     if (!host_frame || size != PIXELS * 3) return -1;
 
+    static FILE* train_file = nullptr;
+    static float* host_float = nullptr;
+    const int CHANNELS = 3;
+
     int next = 1 - cur;
 
     if (!eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) return -1;
@@ -398,6 +424,31 @@ int server_process_frame(unsigned char* host_frame, int size)
     dim3 block(16,16);
     dim3 grid((W + 15) / 16, (H + 15) / 16);
     bgr_to_surface_and_nchw<<<grid, block, 0, stream>>>(d_bgr[next], surf, d_trt[next], W, H, PIXELS);
+
+
+
+    // --- 1. TensorRT Inference ---
+    // Link the pre-processed d_trt[next] to the engine's input node
+    context->setTensorAddress(inputTensorName, d_trt[next]);
+    // Link the output buffer d_out[next] to the engine's output node
+    context->setTensorAddress(outputTensorName, d_out[next]);
+
+    // Run inference asynchronously on your existing stream
+    if (!context->enqueueV3(stream)) {
+        fprintf(stderr, "TensorRT inference failed!\n");
+    }
+
+    // --- 2. Reverse Kernel: float NCHW -> RGBA Surface ---
+    // Launch a new kernel to take the AI output and write it back to the OpenGL surface
+    // (Assuming d_out[next] is a float* of size PIXELS * 3)
+    nchw_to_surface<<<grid, block, 0, stream>>>(
+        (float*)d_out[next], surf, W, H, PIXELS);
+
+    //nchw_to_surface<<<grid, block, 0, stream>>>( //DEBUG
+    //    (float*)d_trt[next], surf, W, H, PIXELS); //DEBUG
+
+
+
 
     // 3. Cleanup CUDA Surface
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -437,84 +488,46 @@ int server_process_frame(unsigned char* host_frame, int size)
     if (!eglSwapBuffers(eglDisplay, eglSurface))
         printf("eglSwapBuffers failed!\n");
 
-    cur = next;
-    return 0;
-}
 
-
-/*int server_process_frame(unsigned char* host_frame, int size)
-{
-    if (!host_frame || size != PIXELS*3)
-        return -1;
-
-    int next = cur;
-    int prev = 1 - cur;
-
-    // Make EGL context current
-    eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
-
-    // --- Fill host_frame with a visible pattern if empty ---
-    if (host_frame[0] == 0 && host_frame[1] == 0 && host_frame[2] == 0)
-    {
-        for (int i=0;i<PIXELS;i++)
-        {
-            host_frame[3*i + 0] = (unsigned char)((i % W) * 255 / W);  // B gradient
-            host_frame[3*i + 1] = (unsigned char)((i / W) * 255 / H);  // G gradient
-            host_frame[3*i + 2] = 128;                                  // R constant
+    
+    // ----------------------------
+    // Training export
+    // ----------------------------
+    if (!train_file) {
+        train_file = fopen("/dev/shm/nn_frames.bin", "wb");
+        if (!train_file) {
+            fprintf(stderr, "Failed to open training file\n");
         }
     }
 
-    // Copy host BGR frame to GPU
-    CUDA_CHECK(cudaMemcpyAsync(d_bgr[next], host_frame, size,
-                               cudaMemcpyHostToDevice, stream));
+    if (train_file) {
+        if (!host_float) {
+            host_float = (float*)malloc(PIXELS * CHANNELS * sizeof(float));
+            if (!host_float) {
+                fprintf(stderr, "Failed to allocate host_float\n");
+            }
+        }
 
-    // Map GL texture
-    CUDA_CHECK(cudaGraphicsMapResources(1, &cuda_tex, stream));
+        if (host_float) {
+            // Copy from NCHW float buffer (d_trt[next])
+            CUDA_CHECK(cudaMemcpyAsync(
+                host_float,
+                d_trt[next],
+                PIXELS * CHANNELS * sizeof(float),
+                cudaMemcpyDeviceToHost,
+                stream));
 
-    cudaArray_t array;
-    CUDA_CHECK(cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex, 0, 0));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    cudaResourceDesc desc = {};
-    desc.resType = cudaResourceTypeArray;
-    desc.res.array.array = array;
-
-    cudaSurfaceObject_t surf;
-    CUDA_CHECK(cudaCreateSurfaceObject(&surf, &desc));
-
-    // Launch kernel: BGR -> RGBA
-    dim3 block(16,16);
-    dim3 grid((W+15)/16, (H+15)/16);
-    bgr_to_surface_and_nchw<<<grid,block,0,stream>>>(d_bgr[next], surf, d_trt[next], W, H, PIXELS);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    CUDA_CHECK(cudaDestroySurfaceObject(surf));
-    CUDA_CHECK(cudaGraphicsUnmapResources(1, &cuda_tex, stream));
-
-    // --- Draw texture ---
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, tex);
-
-    // Clear screen first
-    glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    glBegin(GL_QUADS);
-        glTexCoord2f(0,0); glVertex2f(-1,-1);
-        glTexCoord2f(1,0); glVertex2f(1,-1);
-        glTexCoord2f(1,1); glVertex2f(1,1);
-        glTexCoord2f(0,1); glVertex2f(-1,1);
-    glEnd();
-
-    // Swap buffers
-    if(!eglSwapBuffers(eglDisplay, eglSurface))
-        printf("eglSwapBuffers failed\n");
-
-    // Flip buffer index
-    cur = prev;
-
+            fwrite(host_float, sizeof(float), PIXELS * CHANNELS, train_file);
+            fflush(train_file);
+        }
+    }
+    
+    
+    cur = next;
     return 0;
-} */
+}
 
 void server_cleanup()
 {
