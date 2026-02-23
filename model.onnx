@@ -1,0 +1,281 @@
+
+pytorch2.10.0+cu128:´a
+’	
+input_0
+encoder.0.weight
+encoder.0.biasconv2dnode_conv2d"Conv*
+group *
+pads@@@@ *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ J
+	namespace: __main__.Net/encoder: torch.nn.modules.container.Sequential/encoder.0: torch.nn.modules.conv.Conv2d/conv2d: aten.conv2d.defaultJ’
+pkg.torch.onnx.class_hierarchyp['__main__.Net', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']Jº
+pkg.torch.onnx.fx_nodeŸ%conv2d : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%x, %p_encoder_0_weight, %p_encoder_0_bias, [1, 1], [1, 1]), kwargs = {})JD
+pkg.torch.onnx.name_scopes&['', 'encoder', 'encoder.0', 'conv2d']JÁ
+pkg.torch.onnx.stack_trace¢File "/home/jordan/NN_CAMERA/SERVER/py_trainer_rgb.py", line 28, in forward
+    return self.decoder(self.encoder(x))
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/conv.py", line 553, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+Î
+conv2drelu	node_relu"ReluJ
+	namespace: __main__.Net/encoder: torch.nn.modules.container.Sequential/encoder.1: torch.nn.modules.activation.ReLU/relu: aten.relu.defaultJ”
+pkg.torch.onnx.class_hierarchyr['__main__.Net', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']Jƒ
+pkg.torch.onnx.fx_nodei%relu : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d,), kwargs = {})JB
+pkg.torch.onnx.name_scopes$['', 'encoder', 'encoder.1', 'relu']J¹
+pkg.torch.onnx.stack_tracešFile "/home/jordan/NN_CAMERA/SERVER/py_trainer_rgb.py", line 28, in forward
+    return self.decoder(self.encoder(x))
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 143, in forward
+    return F.relu(input, inplace=self.inplace)
+œ	
+relu
+encoder.2.weight
+encoder.2.biasconv2d_1node_conv2d_1"Conv*
+group *
+pads@@@@ *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ J‘
+	namespaceƒ: __main__.Net/encoder: torch.nn.modules.container.Sequential/encoder.2: torch.nn.modules.conv.Conv2d/conv2d_1: aten.conv2d.defaultJ’
+pkg.torch.onnx.class_hierarchyp['__main__.Net', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']J¿
+pkg.torch.onnx.fx_node¤%conv2d_1 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu, %p_encoder_2_weight, %p_encoder_2_bias, [1, 1], [1, 1]), kwargs = {})JF
+pkg.torch.onnx.name_scopes(['', 'encoder', 'encoder.2', 'conv2d_1']JÁ
+pkg.torch.onnx.stack_trace¢File "/home/jordan/NN_CAMERA/SERVER/py_trainer_rgb.py", line 28, in forward
+    return self.decoder(self.encoder(x))
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/conv.py", line 553, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+Ü
+conv2d_1relu_1node_relu_1"ReluJ‘
+	namespaceƒ: __main__.Net/encoder: torch.nn.modules.container.Sequential/encoder.3: torch.nn.modules.activation.ReLU/relu_1: aten.relu.defaultJ”
+pkg.torch.onnx.class_hierarchyr['__main__.Net', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']J‡
+pkg.torch.onnx.fx_nodem%relu_1 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d_1,), kwargs = {})JD
+pkg.torch.onnx.name_scopes&['', 'encoder', 'encoder.3', 'relu_1']J¹
+pkg.torch.onnx.stack_tracešFile "/home/jordan/NN_CAMERA/SERVER/py_trainer_rgb.py", line 28, in forward
+    return self.decoder(self.encoder(x))
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 143, in forward
+    return F.relu(input, inplace=self.inplace)
+ 	
+relu_1
+decoder.0.weight
+decoder.0.biasconv2d_2node_conv2d_2"Conv*
+group *
+pads@@@@ *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ J‘
+	namespaceƒ: __main__.Net/decoder: torch.nn.modules.container.Sequential/decoder.0: torch.nn.modules.conv.Conv2d/conv2d_2: aten.conv2d.defaultJ’
+pkg.torch.onnx.class_hierarchyp['__main__.Net', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']JÁ
+pkg.torch.onnx.fx_node¦%conv2d_2 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu_1, %p_decoder_0_weight, %p_decoder_0_bias, [1, 1], [1, 1]), kwargs = {})JF
+pkg.torch.onnx.name_scopes(['', 'decoder', 'decoder.0', 'conv2d_2']JÁ
+pkg.torch.onnx.stack_trace¢File "/home/jordan/NN_CAMERA/SERVER/py_trainer_rgb.py", line 28, in forward
+    return self.decoder(self.encoder(x))
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/conv.py", line 553, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+Ü
+conv2d_2relu_2node_relu_2"ReluJ‘
+	namespaceƒ: __main__.Net/decoder: torch.nn.modules.container.Sequential/decoder.1: torch.nn.modules.activation.ReLU/relu_2: aten.relu.defaultJ”
+pkg.torch.onnx.class_hierarchyr['__main__.Net', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']J‡
+pkg.torch.onnx.fx_nodem%relu_2 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d_2,), kwargs = {})JD
+pkg.torch.onnx.name_scopes&['', 'decoder', 'decoder.1', 'relu_2']J¹
+pkg.torch.onnx.stack_tracešFile "/home/jordan/NN_CAMERA/SERVER/py_trainer_rgb.py", line 28, in forward
+    return self.decoder(self.encoder(x))
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 143, in forward
+    return F.relu(input, inplace=self.inplace)
+ 	
+relu_2
+decoder.2.weight
+decoder.2.biasconv2d_3node_conv2d_3"Conv*
+group *
+pads@@@@ *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ J‘
+	namespaceƒ: __main__.Net/decoder: torch.nn.modules.container.Sequential/decoder.2: torch.nn.modules.conv.Conv2d/conv2d_3: aten.conv2d.defaultJ’
+pkg.torch.onnx.class_hierarchyp['__main__.Net', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']JÁ
+pkg.torch.onnx.fx_node¦%conv2d_3 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu_2, %p_decoder_2_weight, %p_decoder_2_bias, [1, 1], [1, 1]), kwargs = {})JF
+pkg.torch.onnx.name_scopes(['', 'decoder', 'decoder.2', 'conv2d_3']JÁ
+pkg.torch.onnx.stack_trace¢File "/home/jordan/NN_CAMERA/SERVER/py_trainer_rgb.py", line 28, in forward
+    return self.decoder(self.encoder(x))
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/conv.py", line 553, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+å
+conv2d_3output_0node_sigmoid"SigmoidJ˜
+	namespaceŠ: __main__.Net/decoder: torch.nn.modules.container.Sequential/decoder.3: torch.nn.modules.activation.Sigmoid/sigmoid: aten.sigmoid.defaultJš
+pkg.torch.onnx.class_hierarchyx['__main__.Net', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.Sigmoid', 'aten.sigmoid.default']J‹
+pkg.torch.onnx.fx_nodeq%sigmoid : [num_users=1] = call_function[target=torch.ops.aten.sigmoid.default](args = (%conv2d_3,), kwargs = {})JE
+pkg.torch.onnx.name_scopes'['', 'decoder', 'decoder.3', 'sigmoid']Jª
+pkg.torch.onnx.stack_trace‹File "/home/jordan/NN_CAMERA/SERVER/py_trainer_rgb.py", line 28, in forward
+    return self.decoder(self.encoder(x))
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/jordan/.local/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 358, in forward
+    return torch.sigmoid(input)
+main_graph*XBencoder.0.weightj
+locationmodel.onnx.dataj
+offset0j
+length1728p*VBencoder.0.biasJ@Ïê>¹Î¼¶ŒÄ¼ëÖÍ½“‡ª=½Î¼¹I>gô=±À=sXÑ;tK>š¨=î€=ø#I>é§>Á‡\½*\ Bencoder.2.weightj
+locationmodel.onnx.dataj
+offset3456j
+length18432p*— Bencoder.2.biasJ€ƒ‘½‘^	½*T=íÛ'=æ…Þ=LNé¸Ÿ£Ž<J½m+H½í”Å=E¼Ž¨ =Ïd{=0^.;¨-<ƒF8½æÊÇ=!öð<l¯½€ä¼; 
+=zõ›½sÅÂ½òÇ=×`„=e$°=Ý¬µ<êeä<ç;Q!ê<¹%%=‰_j¼*] Bdecoder.0.weightj
+locationmodel.onnx.dataj
+offset21888j
+length18432p*VBdecoder.0.biasJ@	ñí<ˆh½‡'={í<Oè‰=¶€ž="¿Õ¼Vc½ÐµC<½,;‰kb½Í`{<±6X»4M„=DD8¼\ÿ=*[Bdecoder.2.weightj
+locationmodel.onnx.dataj
+offset1728j
+length1728p*"Bdecoder.2.biasJ^kk½Cír=Í½R=ZÎ
+input_0
+
+batch
+
+à
+€"=
+/pkg.torch.export.graph_signature.InputSpec.kind
+USER_INPUT"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"&
+!pkg.torch.onnx.original_node_namexb˜
+output_0
+
+batch
+
+à
+€"?
+0pkg.torch.export.graph_signature.OutputSpec.kindUSER_OUTPUT",
+!pkg.torch.onnx.original_node_namesigmoidjà
+encoder.0.weight
+
+
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"7
+!pkg.torch.onnx.original_node_namep_encoder_0_weightjÐ
+encoder.0.bias
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"5
+!pkg.torch.onnx.original_node_namep_encoder_0_biasjà
+encoder.2.weight
+
+ 
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"7
+!pkg.torch.onnx.original_node_namep_encoder_2_weightjÐ
+encoder.2.bias
+
+
+ "<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"5
+!pkg.torch.onnx.original_node_namep_encoder_2_biasjà
+decoder.0.weight
+
+
+ 
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"7
+!pkg.torch.onnx.original_node_namep_decoder_0_weightjÐ
+decoder.0.bias
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"5
+!pkg.torch.onnx.original_node_namep_decoder_0_biasjà
+decoder.2.weight
+
+
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"7
+!pkg.torch.onnx.original_node_namep_decoder_2_weightjÐ
+decoder.2.bias
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"5
+!pkg.torch.onnx.original_node_namep_decoder_2_biasj'
+conv2d
+
+batch
+
+à
+€j%
+relu
+
+batch
+
+à
+€j)
+conv2d_1
+
+batch
+ 
+à
+€j'
+relu_1
+
+batch
+ 
+à
+€j)
+conv2d_2
+
+batch
+
+à
+€j'
+relu_2
+
+batch
+
+à
+€j)
+conv2d_3
+
+batch
+
+à
+€‚
+0pkg.torch.export.ExportedProgram.graph_signatureè
+# inputs
+p_encoder_0_weight: PARAMETER target='encoder.0.weight'
+p_encoder_0_bias: PARAMETER target='encoder.0.bias'
+p_encoder_2_weight: PARAMETER target='encoder.2.weight'
+p_encoder_2_bias: PARAMETER target='encoder.2.bias'
+p_decoder_0_weight: PARAMETER target='decoder.0.weight'
+p_decoder_0_bias: PARAMETER target='decoder.0.bias'
+p_decoder_2_weight: PARAMETER target='decoder.2.weight'
+p_decoder_2_bias: PARAMETER target='decoder.2.bias'
+x: USER_INPUT
+
+# outputs
+sigmoid: USER_OUTPUT
+‚J
+2pkg.torch.export.ExportedProgram.range_constraints{s77: VR[0, int_oo]}B
+ 
