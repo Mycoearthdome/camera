@@ -58,24 +58,30 @@ loop:
 
 			// resize to exact dimensions
 			gocv.Resize(img, &img, image.Point{X: Width, Y: Height}, 0, 0, gocv.InterpolationDefault)
-			payload := img.ToBytes() // guaranteed to be Width*Height*3
+			quality := []int{gocv.IMWriteJpegQuality, 80} // 80% quality is a good balance
+			buf, err := gocv.IMEncodeWithParams(gocv.JPEGFileExt, img, quality)
+			if err != nil {
+				log.Printf("Encode error: %v\n", err)
+				continue
+			}
+			payload := buf.GetBytes()
+			totalSize := uint32(len(payload))
 
-			// send in chunks
 			for offset := 0; offset < len(payload); offset += ChunkSize {
 				end := offset + ChunkSize
 				if end > len(payload) {
 					end = len(payload)
 				}
-				size := end - offset
+				chunkSize := end - offset
 
-				buf := make([]byte, 10+size)
-				// header: frameID (4B) | offset (4B) | size (2B)
-				binary.BigEndian.PutUint32(buf[0:4], frameID)
-				binary.BigEndian.PutUint32(buf[4:8], uint32(offset))
-				binary.BigEndian.PutUint16(buf[8:10], uint16(size))
-				copy(buf[10:], payload[offset:end])
+				// New header: 12 bytes
+				headerBuf := make([]byte, 12+chunkSize)
+				binary.BigEndian.PutUint32(headerBuf[0:4], frameID)
+				binary.BigEndian.PutUint32(headerBuf[4:8], uint32(offset))
+				binary.BigEndian.PutUint32(headerBuf[8:12], totalSize) // Send total JPEG size
+				copy(headerBuf[12:], payload[offset:end])
 
-				_, err := conn.Write(buf)
+				conn.Write(headerBuf)
 				if err != nil {
 					log.Printf("UDP send error: %v\n", err)
 				}

@@ -108,7 +108,7 @@ __global__ void bgr_to_surface_and_nchw(
     unsigned char r = bgr[i + 2];
 
     // Optional debug (single pixel only)
-    // if (x==0 && y==0)
+    //if (x==0 && y==0)
     //     printf("BGR = %d %d %d\n", b,g,r);
 
     // Write RGBA8 (OpenGL)
@@ -489,7 +489,7 @@ int server_process_frame(unsigned char* host_frame, int size)
         printf("eglSwapBuffers failed!\n");
 
 
-    
+    /*
     // ----------------------------
     // Training export
     // ----------------------------
@@ -523,6 +523,7 @@ int server_process_frame(unsigned char* host_frame, int size)
             fflush(train_file);
         }
     }
+    */
     
     
     cur = next;
