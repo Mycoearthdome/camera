@@ -27,6 +27,28 @@ static void jpeg_error_exit(j_common_ptr cinfo) {
     longjmp(err->setjmp_buffer, 1);
 }
 
+// Helper to swap 64-bit doubles from Big Endian to Host Endian
+double ntohd(const uint8_t* buf) {
+    uint64_t temp;
+    memcpy(&temp, buf, 8);
+    
+    // Swap bytes: 01234567 -> 76543210
+    //temp = ((temp & 0xFF00000000000000ULL) >> 56) |
+    //       ((temp & 0x00FF000000000000ULL) >> 48) |
+    //       ((temp & 0x0000FF0000000000ULL) >> 40) |
+    //       ((temp & 0x000000FF00000000ULL) >> 32) |
+    //       ((temp & 0x00000000FF000000ULL) >> 24) |
+    //       ((temp & 0x0000000000FF0000ULL) >> 16) |
+    //       ((temp & 0x000000000000FF00ULL) >> 8)  |
+    //       ((temp & 0x00000000000000FFULL));
+
+    temp = __builtin_bswap64(temp);
+           
+    double result;
+    memcpy(&result, &temp, 8);
+    return result;
+}
+
 /*
  * Decode JPEG from memory into BGR format.
  *
@@ -165,41 +187,50 @@ int main(int argc, char** argv) {
 
     // ---------------- Main loop ----------------
     while (keep_running) {
-        unsigned char buf[12 + CHUNK_SIZE]; 
+        // 1. Buffer must accommodate the 28-byte header + 1200-byte payload
+        unsigned char buf[28 + CHUNK_SIZE]; 
         int n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr*)&client, &client_len);
-        if (n < 12) continue; 
+        
+        // 2. Minimum packet size check (Header is 28 bytes)
+        if (n < 28) continue; 
 
         uint32_t frame_id   = ntohl(*(uint32_t*)(buf + 0));
         uint32_t offset     = ntohl(*(uint32_t*)(buf + 4));
         uint32_t total_size = ntohl(*(uint32_t*)(buf + 8));
-        uint32_t chunk_size = n - 12;
+        double latitude     = ntohd(buf + 12);
+        double longitude    = ntohd(buf + 20);
 
-        // Reset buffer if a new frame starts
-        if (frame_id != current_frame) {
+        // Payload size is total packet size minus the header
+        uint32_t chunk_size = n - 28;
+
+        // Reset buffer if a new frame starts (Simple reassembly)
+        if (frame_id > current_frame) {
             bytes_received = 0;
             current_frame = frame_id;
         }
 
-        // Copy payload into assembly buffer
+        // 3. Use the 28-byte offset to find the start of the JPEG data
         if (offset + chunk_size <= FRAME_SIZE) {
-            memcpy(frame_buffer + offset, buf + 12, chunk_size);
+            memcpy(frame_buffer + offset, buf + 28, chunk_size);
             bytes_received += chunk_size;
         }
 
-        // Frame complete: Trigger JPEG decompression
+        // 4. Frame complete check
         if (bytes_received >= total_size && total_size > 0) {
             int outW, outH, outC;
             
-            // Use the function already defined in your main.c
+            // Pass the assembled frame_buffer (containing the full JPEG) to the decoder
             uint8_t* bgr_pixels = jpeg_to_bgr(frame_buffer, total_size, &outW, &outH, &outC);
             
             if (bgr_pixels) {
+                // Log telemetry before processing
+                printf("FRAME: %u | LAT: %f | LON: %f | SIZE: %u\n", current_frame, latitude, longitude, total_size);
+                
                 server_process_frame(bgr_pixels, outW * outH * outC);
-                free(bgr_pixels); // Important: jpeg_to_bgr uses malloc
+                free(bgr_pixels); 
             }
             
             bytes_received = 0;
-            current_frame++; 
         }
     }
     printf("\nShutting down server...\n");
