@@ -1,73 +1,122 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:camera/camera.dart';
 import 'package:image/image.dart' as img;
 import 'package:geolocator/geolocator.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const CyberApp());
 }
 
-// --- BACKGROUND WORKER: Rotation, Scaling & Color ---
-Future<Uint8List> processFrame(Map<String, dynamic> params) async {
+class InferenceResult {
+  final Uint8List mosaicJpeg;
+  final List<Rect> uiBoxes;
+  InferenceResult(this.mosaicJpeg, this.uiBoxes);
+}
+
+// --- BACKGROUND WORKER (THREAD) ---
+Future<InferenceResult> processInference(Map<String, dynamic> params) async {
   final CameraImage image = params['image'];
   final int sensorOrientation = params['sensorOrientation'];
-  
+  final Interpreter interpreter = params['interpreter'];
+  final double screenW = params['screenWidth'];
+  final double screenH = params['screenHeight'];
+
   try {
-    final int srcW = image.width;
-    final int srcH = image.height;
-    const int targetW = 640;
-    const int targetH = 480;
+    final int width = image.width;
+    final int height = image.height;
+    var fullRgb = img.Image(width: width, height: height);
+    
+    // Optimized YUV -> RGB
+    final planes = image.planes;
+    final yBytes = planes[0].bytes;
+    final uBytes = planes[1].bytes;
+    final vBytes = planes[2].bytes;
+    final int yRowStride = planes[0].bytesPerRow;
+    final int uvRowStride = planes[1].bytesPerRow;
+    final int uvPixelStride = planes[1].bytesPerPixel!;
 
-    var rgbImage = img.Image(width: targetW, height: targetH);
-    final Uint8List yPlane = image.planes[0].bytes;
-    final Uint8List uPlane = image.planes[1].bytes;
-    final Uint8List vPlane = image.planes[2].bytes;
-    final int uvRowStride = image.planes[1].bytesPerRow;
-    final int uvPixelStride = image.planes[1].bytesPerPixel!;
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        final int uvIndex = (y >> 1) * uvRowStride + (x >> 1) * uvPixelStride;
+        final int yIndex = y * yRowStride + x;
+        final int yp = yBytes[yIndex];
+        final int up = uBytes[uvIndex];
+        final int vp = vBytes[uvIndex];
 
-    for (int y = 0; y < targetH; y++) {
-      for (int x = 0; x < targetW; x++) {
-        int srcX, srcY;
-        if (sensorOrientation == 90) {
-          srcX = (y * (srcW / targetH)).toInt().clamp(0, srcW - 1);
-          srcY = ((targetW - x - 1) * (srcH / targetW)).toInt().clamp(0, srcH - 1);
-        } else {
-          srcX = (x * (srcW / targetW)).toInt().clamp(0, srcW - 1);
-          srcY = (y * (srcH / targetH)).toInt().clamp(0, srcH - 1);
-        }
-
-        final int yIndex = srcY * srcW + srcX;
-        final int uvIndex = (srcY >> 1) * uvRowStride + (srcX >> 1) * uvPixelStride;
-
-        final int yp = yPlane[yIndex];
-        final int up = uPlane[uvIndex.clamp(0, uPlane.length - 1)];
-        final int vp = vPlane[uvIndex.clamp(0, vPlane.length - 1)];
-
-        int r = (yp + 1.370705 * (vp - 128)).toInt().clamp(0, 255);
-        int g = (yp - 0.337633 * (up - 128) - 0.698001 * (vp - 128)).toInt().clamp(0, 255);
-        int b = (yp + 1.732446 * (up - 128)).toInt().clamp(0, 255);
-
-        rgbImage.setPixelRgb(x, y, r, g, b);
+        int r = (yp + ((vp - 128) * 1436 >> 10)).clamp(0, 255);
+        int g = (yp - ((up - 128) * 352 >> 10) - ((vp - 128) * 731 >> 10)).clamp(0, 255);
+        int b = (yp + ((up - 128) * 1814 >> 10)).clamp(0, 255);
+        fullRgb.setPixelRgb(x, y, r, g, b);
       }
     }
-    return Uint8List.fromList(img.encodeJpg(rgbImage, quality: 30));
+    
+    if (sensorOrientation == 90) fullRgb = img.copyRotate(fullRgb, angle: 90);
+
+    // YOLO Inference Prep
+    img.Image modelInput = img.copyResize(fullRgb, width: 640, height: 640, interpolation: img.Interpolation.nearest);
+    final inputBuffer = Float32List(1 * 640 * 640 * 3);
+    int pIdx = 0;
+    for (var pixel in modelInput) {
+      inputBuffer[pIdx++] = pixel.r / 255.0;
+      inputBuffer[pIdx++] = pixel.g / 255.0;
+      inputBuffer[pIdx++] = pixel.b / 255.0;
+    }
+
+    var output = List.filled(1 * 300 * 6, 0.0).reshape([1, 300, 6]);
+    interpreter.run(inputBuffer.reshape([1, 640, 640, 3]), output);
+
+    List<img.Image> crops = [];
+    List<Rect> uiBoxes = [];
+    
+    for (var det in output[0]) {
+      if (det[4] > 0.45 && det[5] == 0) { // Confidence + Class Face/Person
+        // Scaled to UI dimensions immediately in the thread
+        uiBoxes.add(Rect.fromLTRB(det[0] * screenW, det[1] * screenH, det[2] * screenW, det[3] * screenH));
+
+        int x1 = (det[0] * fullRgb.width).toInt().clamp(0, fullRgb.width);
+        int y1 = (det[1] * fullRgb.height).toInt().clamp(0, fullRgb.height);
+        int x2 = (det[2] * fullRgb.width).toInt().clamp(0, fullRgb.width);
+        int y2 = (det[3] * fullRgb.height).toInt().clamp(0, fullRgb.height);
+        
+        int h = (y2 - y1).abs();
+        if ((x2 - x1).abs() > 15) {
+          // Crop only the top 40% (the head/face)
+          crops.add(img.copyCrop(fullRgb, x: x1, y: y1, width: (x2 - x1).abs(), height: (h * 0.4).toInt()));
+        }
+      }
+      if (crops.length >= 16) break; 
+    }
+
+    if (crops.isEmpty) return InferenceResult(Uint8List(0), uiBoxes);
+
+    // Mosaic Logic
+    int count = crops.length;
+    int cols = (count <= 1) ? 1 : (count <= 4) ? 2 : (count <= 9) ? 3 : 4;
+    int rows = (count / cols).ceil();
+    final int tW = (640 / cols).floor();
+    final int tH = (480 / rows).floor();
+
+    img.Image mosaic = img.Image(width: 640, height: 480, backgroundColor: img.ColorRgb8(0, 0, 0));
+    for (int i = 0; i < crops.length; i++) {
+      img.Image resFace = img.copyResize(crops[i], width: tW, height: tH, interpolation: img.Interpolation.nearest);
+      img.compositeImage(mosaic, resFace, dstX: (i % cols) * tW, dstY: (i ~/ cols) * tH);
+    }
+
+    return InferenceResult(Uint8List.fromList(img.encodeJpg(mosaic, quality: count > 6 ? 30 : 50)), uiBoxes);
   } catch (e) {
-    return Uint8List(0);
+    return InferenceResult(Uint8List(0), []);
   }
 }
 
+// --- MAIN UI ---
 class CyberApp extends StatelessWidget {
   const CyberApp({super.key});
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    debugShowCheckedModeBanner: false,
-    theme: ThemeData.dark(),
-    home: const UplinkScreen(),
-  );
+  Widget build(BuildContext context) => MaterialApp(debugShowCheckedModeBanner: false, theme: ThemeData.dark(), home: const UplinkScreen());
 }
 
 class UplinkScreen extends StatefulWidget {
@@ -79,23 +128,12 @@ class UplinkScreen extends StatefulWidget {
 class _UplinkScreenState extends State<UplinkScreen> {
   CameraController? _controller;
   RawDatagramSocket? _socket;
+  Interpreter? _interpreter;
   bool _isTransmitting = false;
   bool _isProcessing = false;
-  int _frameIdCounter = 0;
-  int _sensorOrientation = 0;
-  
-  // Zoom State
-  double _currentZoom = 1.0;
-  double _minZoom = 1.0;
-  double _maxZoom = 1.0;
-  double _baseZoom = 1.0;
-  
-  String _status = "INITIALIZING...";
-  String _coords = "AWAITING GPS...";
-  double _lastLat = 0.0, _lastLon = 0.0;
-
-  final String _targetIp = "192.168.1.151"; 
-  final int _targetPort = 5000;
+  int _frameId = 0;
+  List<Rect> _currentBoxes = [];
+  double _lat = 0.0, _lon = 0.0;
 
   @override
   void initState() {
@@ -104,172 +142,104 @@ class _UplinkScreenState extends State<UplinkScreen> {
   }
 
   Future<void> _initSystems() async {
+    _interpreter = await Interpreter.fromAsset('assets/models/yolo26n_int8.tflite');
     _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-    final cameras = await availableCameras();
-    if (cameras.isEmpty) return;
-
-    final camera = cameras.first;
-    _sensorOrientation = camera.sensorOrientation;
-
-    _controller = CameraController(
-      camera, 
-      ResolutionPreset.low, 
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
-    
+    final cams = await availableCameras();
+    _controller = CameraController(cams.first, ResolutionPreset.low, enableAudio: false);
     await _controller!.initialize();
-
-    // Setup Zoom Limits
-    _minZoom = await _controller!.getMinZoomLevel();
-    _maxZoom = await _controller!.getMaxZoomLevel();
-
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
-
-    Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 1)
-    ).listen((pos) {
-      _lastLat = pos.latitude; 
-      _lastLon = pos.longitude;
-      if (mounted) setState(() => _coords = "LAT: ${_lastLat.toStringAsFixed(6)} | LON: ${_lastLon.toStringAsFixed(6)}");
-    });
-
-    if (mounted) setState(() => _status = "LINK_READY");
+    Geolocator.getPositionStream().listen((p) => setState(() { _lat = p.latitude; _lon = p.longitude; }));
   }
 
-  void _handleZoom(double zoom) {
-    double clampedZoom = zoom.clamp(_minZoom, _maxZoom);
-    setState(() => _currentZoom = clampedZoom);
-    _controller?.setZoomLevel(clampedZoom);
-  }
-
-  void _toggleUplink() async {
-    if (_isTransmitting) {
-      await _controller!.stopImageStream();
-      setState(() { _isTransmitting = false; _status = "OFFLINE"; });
+  void _toggleUplink() {
+    setState(() => _isTransmitting = !_isTransmitting);
+    if (!_isTransmitting) {
+      _controller?.stopImageStream();
+      setState(() => _currentBoxes = []);
       return;
     }
-
-    if (_lastLat == 0.0) {
-      setState(() => _status = "WAITING FOR GPS...");
-      Position p = await Geolocator.getCurrentPosition();
-      _lastLat = p.latitude;
-      _lastLon = p.longitude;
-    }
-
-    setState(() { _isTransmitting = true; _status = "UPLINK_ACTIVE"; });
-
-    _controller!.startImageStream((CameraImage image) async {
-      if (!_isTransmitting || _isProcessing) return;
+    _controller?.startImageStream((img) async {
+      if (_isProcessing || !_isTransmitting) return;
       _isProcessing = true;
+      
+      final Size screen = MediaQuery.of(context).size;
+      final res = await compute(processInference, {
+        'image': img, 
+        'sensorOrientation': _controller!.description.sensorOrientation, 
+        'interpreter': _interpreter,
+        'screenWidth': screen.width,
+        'screenHeight': screen.height,
+      });
 
-      final double snapLat = _lastLat;
-      final double snapLon = _lastLon;
-
-      try {
-        final Uint8List jpegBytes = await compute(processFrame, {
-          'image': image,
-          'sensorOrientation': _sensorOrientation,
-        });
-
-        if (jpegBytes.isNotEmpty) {
-          final int totalSize = jpegBytes.length;
-          final int frameId = _frameIdCounter++;
-          final InternetAddress dest = InternetAddress(_targetIp);
-
-          for (int offset = 0; offset < totalSize; offset += 1200) {
-            int end = (offset + 1200 < totalSize) ? offset + 1200 : totalSize;
-            
-            final header = ByteData(28);
-            header.setUint32(0, frameId, Endian.big);
-            header.setUint32(4, offset, Endian.big);
-            header.setUint32(8, totalSize, Endian.big);
-            header.setFloat64(12, snapLat, Endian.big);
-            header.setFloat64(20, snapLon, Endian.big);
-
-            final builder = BytesBuilder(copy: false);
-            builder.add(header.buffer.asUint8List());
-            builder.add(jpegBytes.sublist(offset, end));
-            _socket?.send(builder.toBytes(), dest, _targetPort);
+      if (mounted) {
+        setState(() {
+          // SIMPLE PREDICTIVE SMOOTHING: 
+          // If we had boxes, we LERP them towards the new ones for a smoother adjust
+          if (_currentBoxes.length == res.uiBoxes.length) {
+            _currentBoxes = List.generate(_currentBoxes.length, (i) {
+              return Rect.lerp(_currentBoxes[i], res.uiBoxes[i], 0.6)!; // 60% move to target
+            });
+          } else {
+            _currentBoxes = res.uiBoxes;
           }
-        }
-      } catch (e) {
-        debugPrint("TX_ERR: $e");
-      } finally {
-        _isProcessing = false;
+        });
+        if (res.mosaicJpeg.isNotEmpty) _sendUdp(res.mosaicJpeg);
       }
+      _isProcessing = false;
     });
+  }
+
+  void _sendUdp(Uint8List data) {
+    final dest = InternetAddress("192.168.1.151");
+    final int total = data.length;
+    final fId = _frameId++;
+    for (int i = 0; i < total; i += 1200) {
+      int len = (i + 1200 < total) ? 1200 : total - i;
+      final packet = Uint8List(28 + len);
+      final view = ByteData.view(packet.buffer);
+      view.setUint32(0, fId); view.setUint32(4, i); view.setUint32(8, total);
+      view.setFloat64(12, _lat); view.setFloat64(20, _lon);
+      packet.setRange(28, 28 + len, data, i);
+      _socket?.send(packet, dest, 5000);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_controller == null || !_controller!.value.isInitialized) {
-      return const Scaffold(backgroundColor: Colors.black, body: Center(child: CircularProgressIndicator()));
-    }
+    if (_controller == null || !_controller!.value.isInitialized) return const Scaffold(body: Center(child: CircularProgressIndicator()));
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(children: [
-        // PINCH GESTURE LAYER
-        Positioned.fill(
-          child: GestureDetector(
-            onScaleStart: (details) => _baseZoom = _currentZoom,
-            onScaleUpdate: (details) => _handleZoom(_baseZoom * details.scale),
-            child: CameraPreview(_controller!),
-          ),
-        ),
-        _buildOverlay(),
-        _buildZoomSlider(),
-        Align(alignment: const Alignment(0, 0.9), child: _buildButton()),
+        CameraPreview(_controller!),
+        RepaintBoundary(child: CustomPaint(size: Size.infinite, painter: BoundingBoxPainter(_currentBoxes))),
+        _buildHud(),
+        Align(alignment: const Alignment(0, 0.9), child: FloatingActionButton(
+          backgroundColor: _isTransmitting ? Colors.red : Colors.cyan,
+          onPressed: _toggleUplink, child: Icon(_isTransmitting ? Icons.stop : Icons.sensors),
+        )),
       ]),
     );
   }
 
-  Widget _buildOverlay() {
+  Widget _buildHud() {
     return SafeArea(child: Padding(padding: const EdgeInsets.all(20), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Text("SYSTEM: $_status", style: const TextStyle(color: Colors.cyan, fontFamily: 'monospace', fontWeight: FontWeight.bold)),
-      Text(_coords, style: const TextStyle(color: Colors.pinkAccent, fontFamily: 'monospace', fontSize: 12)),
-      const Spacer(),
-      Text("ZOOM: ${_currentZoom.toStringAsFixed(1)}x", style: const TextStyle(color: Colors.yellow, fontFamily: 'monospace')),
+      Text("LINK: ${_isTransmitting ? 'ACTIVE' : 'READY'}", style: TextStyle(color: _isTransmitting ? Colors.red : Colors.cyan, fontFamily: 'monospace', fontWeight: FontWeight.bold)),
+      Text("GPS: ${_lat.toStringAsFixed(6)}, ${_lon.toStringAsFixed(6)}", style: const TextStyle(fontSize: 10, fontFamily: 'monospace')),
+      if (_isTransmitting) Text("TARGETS: ${_currentBoxes.length}", style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
     ])));
   }
 
-  Widget _buildZoomSlider() {
-    return Positioned(
-      right: 10, top: 100, bottom: 200,
-      child: RotatedBox(
-        quarterTurns: 3,
-        child: Slider(
-          value: _currentZoom,
-          min: _minZoom,
-          max: _maxZoom,
-          activeColor: Colors.cyan,
-          onChanged: _handleZoom,
-        ),
-      ),
-    );
-  }
-
-  Widget _buildButton() {
-    return InkResponse(
-      onTap: _toggleUplink,
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          border: Border.all(color: _isTransmitting ? Colors.red : Colors.cyan, width: 3),
-        ),
-        child: Icon(_isTransmitting ? Icons.stop : Icons.sensors, color: Colors.white, size: 40),
-      ),
-    );
-  }
-
   @override
-  void dispose() {
-    _controller?.dispose();
-    _socket?.close();
-    super.dispose();
+  void dispose() { _controller?.dispose(); _socket?.close(); super.dispose(); }
+}
+
+class BoundingBoxPainter extends CustomPainter {
+  final List<Rect> boxes;
+  BoundingBoxPainter(this.boxes);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.cyanAccent..style = PaintingStyle.stroke..strokeWidth = 2.0;
+    for (var box in boxes) {canvas.drawRect(box, paint);}
   }
+  @override
+  bool shouldRepaint(covariant BoundingBoxPainter old) => old.boxes != boxes;
 }
