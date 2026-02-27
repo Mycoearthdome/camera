@@ -93,4 +93,4 @@ flutter:
   # see https://flutter.dev/to/font-from-package
   uses-material-design: true
   assets:
-    - assets/models/yolo26n_int8.tflite
+    - assets/models/yolov8n-face_int8.tflite
