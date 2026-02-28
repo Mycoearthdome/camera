@@ -8,6 +8,7 @@ import 'package:camera/camera.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
 import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 const int inputSize = 640;
 const int numAnchors = 8400;
@@ -16,6 +17,15 @@ const int numChannels = 20; // 0-3: box, 4: conf, 5-19: landmarks
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const CyberApp());
+}
+
+class MediaCommand {
+  final Uint8List rgbBytes;
+  final List<_Det> rawDets;
+  final bool isFront;
+  final double lat, lon;
+  final double previewW, previewH;  // Camera preview size
+  MediaCommand(this.rgbBytes, this.rawDets, this.isFront, this.lat, this.lon, this.previewW, this.previewH);
 }
 
 class WorkerCommand {
@@ -91,9 +101,9 @@ img.Image cropCameraImage(CameraImage image, _Det det, bool isFront) {
   // Orientation fix
   if (isFront) {
     tile = img.flipHorizontal(tile);
-    tile = img.copyRotate(tile, angle: 270);
+    tile = img.copyRotate(tile, angle: 270); //270
   } else {
-    tile = img.copyRotate(tile, angle: 90);
+    tile = img.copyRotate(tile, angle: 90); //90
   }
 
   return tile;
@@ -114,7 +124,110 @@ Size _getScreenPreviewSize(CameraController controller, BuildContext context) {
 }
 
 //-----------------------------------------------------
-// WORKER (BACKGROUND ISOLATE)
+// MEDIA WORKER (BACKGROUND ISOLATE)
+//-----------------------------------------------------
+void mediaProcessingWorker(SendPort mainSendPort) async {
+  final port = ReceivePort();
+  mainSendPort.send(port.sendPort);
+
+  RawDatagramSocket? udp = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+  final dest = InternetAddress("192.168.1.151");
+  int globalFrameCounter = 0;
+
+  await for (final msg in port) {
+    if (msg is! MediaCommand) continue;
+
+    // 1. Create the source image from the RGB buffer once
+    final fullFrame = img.Image.fromBytes(
+      width: 640,
+      height: 640,
+      bytes: msg.rgbBytes.buffer,
+      numChannels: 3,
+    );
+
+    // 2. Iterate through all detections in steps of 16
+    for (int chunkStart = 0; chunkStart < msg.rawDets.length; chunkStart += 16) {
+      final mosaic = img.Image(
+        width: 640, 
+        height: 640, 
+        backgroundColor: img.ColorRgb8(0, 0, 0)
+      );
+
+      bool hasFacesInChunk = false;
+
+      // Fill the 4x4 grid (16 slots)
+      for (int i = 0; i < 16 && (chunkStart + i) < msg.rawDets.length; i++) {
+        hasFacesInChunk = true;
+        final d = msg.rawDets[chunkStart + i];
+        final previewW = msg.previewW;
+        final previewH = msg.previewH;
+
+        double width  = d.w * previewW;
+        double height = d.h * previewH;
+        double top    = d.y * previewH;
+
+        // Convert right-side reference to left
+        double left = previewW - d.x - width;
+
+        // Mirror for front camera
+        if (msg.isFront) {
+          left = previewW - left;
+        }
+
+        // Crop directly using model-space coordinates (0-640)
+        var tile = img.copyCrop(
+          fullFrame,
+          x: left.toInt().clamp(0, 639),
+          y: top.toInt().clamp(0, 639),
+          width: width.toInt().clamp(1, 640),
+          height: height.toInt().clamp(1, 640),
+        );
+
+        // Fast resize and orientation fix
+        tile = img.copyResize(tile, width: 160, height: 160, interpolation: img.Interpolation.nearest);
+        tile = img.copyRotate(tile, angle: msg.isFront ? 270 : 90); //270 : 90
+        if (msg.isFront) tile = img.flipHorizontal(tile);
+
+        // Composite into the 4x4 mosaic grid
+        img.compositeImage(
+          mosaic,
+          tile,
+          dstX: (i % 4) * 160,
+          dstY: (i ~/ 4) * 160,
+        );
+      }
+
+      // 3. Encode and Stream via UDP if we have data
+      if (hasFacesInChunk) {
+        final jpeg = Uint8List.fromList(img.encodeJpg(mosaic, quality: 30));
+        globalFrameCounter++;
+        
+        // Chunk the JPEG into UDP packets
+        _streamUdp(udp, jpeg, dest, globalFrameCounter, msg.lat, msg.lon);
+      }
+    }
+  }
+}
+
+void _streamUdp(RawDatagramSocket? udp, Uint8List jpeg, InternetAddress dest, int frameId, double lat, double lon) {
+  for (int i = 0; i < jpeg.length; i += 1100) {
+    final len = (i + 1100 < jpeg.length) ? 1100 : jpeg.length - i;
+    final packet = Uint8List(28 + len);
+    final view = ByteData.view(packet.buffer);
+
+    view.setUint32(0, frameId, Endian.big);
+    view.setUint32(4, i, Endian.big);
+    view.setUint32(8, jpeg.length, Endian.big);
+    view.setFloat64(12, lat, Endian.big);
+    view.setFloat64(20, lon, Endian.big);
+
+    packet.setRange(28, 28 + len, jpeg, i);
+    udp?.send(packet, dest, 5000);
+  }
+}
+
+//-----------------------------------------------------
+// UPDATED WORKER (BACKGROUND ISOLATE)
 //-----------------------------------------------------
 void backgroundInferenceWorker(SendPort mainSendPort) async {
   final port = ReceivePort();
@@ -122,163 +235,64 @@ void backgroundInferenceWorker(SendPort mainSendPort) async {
 
   Interpreter? interpreter;
   Float32List? inputBuffer;
+  Uint8List? rgbBytes;
   List<List<List<double>>>? outputBuffer;
 
-  RawDatagramSocket? udp;
-  final dest = InternetAddress("192.168.1.151");
-  int frameCounter = 0;
-
-  try {
-    udp = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-  } catch (e) {
-    mainSendPort.send("DEBUG: UDP Bind Error: $e");
-  }
-
-  Uint8List? rgbBytes;
+  // CRITICAL FIX: Move these outside the loop to persist across frames
+  SendPort? mediaPort;
 
   await for (final msg in port) {
     if (msg is! WorkerCommand) continue;
 
     try {
-      // ------------------------
-      // Interpreter init (once)
-      // ------------------------
       if (interpreter == null) {
-        final options = InterpreterOptions();
-        if (Platform.isAndroid) {
-          try {
-            options.addDelegate(GpuDelegateV2());
-          } catch (_) {
-            mainSendPort.send("DEBUG: GPU failed, using CPU");
-          }
-        }
-
-        interpreter = Interpreter.fromBuffer(msg.modelBytes!, options: options);
-
+        // ... Init interpreter options ...
+        interpreter = Interpreter.fromBuffer(msg.modelBytes!);
         inputBuffer = Float32List(inputSize * inputSize * 3);
         rgbBytes = Uint8List(inputSize * inputSize * 3);
-
-        outputBuffer = List.generate(
-          1,
-          (_) => List.generate(
-            numChannels,
-            (_) => List<double>.filled(numAnchors, 0.0),
-          ),
-        );
-
-        mainSendPort.send("DEBUG: Pipeline Ready. Shape: [1, $numChannels, $numAnchors]");
+        outputBuffer = List.generate(1, (_) => List.generate(numChannels, (_) => List<double>.filled(numAnchors, 0.0)));
+        
+        // SPAWN MEDIA WORKER ONCE
+        final p = ReceivePort();
+        await Isolate.spawn(mediaProcessingWorker, p.sendPort);
+        mediaPort = await p.first as SendPort;
+        
+        mainSendPort.send("DEBUG: Full Pipeline Initialized");
       }
 
-      // ------------------------
-      // Preprocess
-      // ------------------------
       _yuvStandardized(msg.image, inputBuffer!, rgbBytes!, msg.isFront);
 
-      // ------------------------
-      // Inference
-      // ------------------------
-      interpreter.run(
-        inputBuffer.reshape([1, inputSize, inputSize, 3]),
-        outputBuffer!,
-      );
+      interpreter.run(inputBuffer.reshape([1, inputSize, inputSize, 3]), outputBuffer!);
 
-      // ------------------------
-      // Decode
-      // ------------------------
       final decoded = _decodeYOLOWithConfFixed(
-        mainSendPort,
-        outputBuffer,
-        msg.screenW,
-        msg.screenH,
-        inputSize.toDouble(),
-        inputSize.toDouble(),
-        msg.isFront,
-        Size(msg.previewW, msg.previewH), // preview size passed in WorkerCommand
+        mainSendPort, outputBuffer,
+        msg.screenW, msg.screenH,
+        inputSize.toDouble(), inputSize.toDouble(),
+        msg.isFront, Size(msg.previewW, msg.previewH),
       );
 
-      final nmsDets = decoded.rawDets;
-      Uint8List? jpeg;
-
-      // ------------------------
-      // Mosaic (only if faces)
-      // ------------------------
-      if (decoded.boxes.isNotEmpty) {
-        final mosaic = img.Image(
-          width: 640,
-          height: 640,
-          backgroundColor: img.ColorRgb8(0, 0, 0),
-        );
-
-        // Use the preprocessed RGB frame
-        final fullFrame = img.Image.fromBytes(
-          width: inputSize,
-          height: inputSize,
-          bytes: rgbBytes.buffer,
-          numChannels: 3,
-        );
-
-        for (int idx = 0; idx < decoded.boxes.length && idx < 16; idx++) {
-          final box = decoded.boxes[idx];
-
-          // Map UI box (screen coordinates) back to model pixels
-          int x = (box.left / msg.previewW * inputSize).round().clamp(0, inputSize - 1);
-          int y = (box.top / msg.previewH * inputSize).round().clamp(0, inputSize - 1);
-          int w = (box.width / msg.previewW * inputSize).round().clamp(1, inputSize - x);
-          int h = (box.height / msg.previewH * inputSize).round().clamp(1, inputSize - y);
-
-          var tile = img.copyCrop(fullFrame, x: x, y: y, width: w, height: h);
-          tile = img.copyResize(tile, width: 160, height: 160, maintainAspect: true);
-
-          // Orientation
-          tile = img.copyRotate(tile, angle: msg.isFront ? 270 : 90);
-          if (msg.isFront) tile = img.flipHorizontal(tile);
-
-          img.compositeImage(
-            mosaic,
-            tile,
-            dstX: (idx % 4) * 160,
-            dstY: (idx ~/ 4) * 160,
-          );
-        }
-
-        jpeg = Uint8List.fromList(img.encodeJpg(mosaic, quality: 45));
+      // OFF-LOAD TO MEDIA WORKER
+      if (decoded.rawDets.isNotEmpty && mediaPort != null) {
+        mediaPort.send(MediaCommand(
+          Uint8List.fromList(rgbBytes!), // Send copy
+          decoded.rawDets,
+          msg.isFront,
+          msg.latitude,
+          msg.longitude,
+          msg.previewH,
+          msg.previewW,
+        ));
       }
-      // ------------------------
-      // Send result
-      // ------------------------
+
       mainSendPort.send(InferenceResult(
         decoded.boxes,
         decoded.confidences,
-        jpeg: jpeg,
-        stats: "${nmsDets.length} faces",
+        stats: "${decoded.rawDets.length} faces",
       ));
 
-      // ------------------------
-      // UDP streaming
-      // ------------------------
-      if (udp != null && jpeg != null) {
-        frameCounter++;
-        for (int i = 0; i < jpeg.length; i += 1100) {
-          final len = (i + 1100 < jpeg.length) ? 1100 : jpeg.length - i;
-          final packet = Uint8List(28 + len);
-          final view = ByteData.view(packet.buffer);
-
-          view.setUint32(0, frameCounter, Endian.big);
-          view.setUint32(4, i, Endian.big);
-          view.setUint32(8, jpeg.length, Endian.big);
-          view.setFloat64(12, msg.latitude, Endian.big);
-          view.setFloat64(20, msg.longitude, Endian.big);
-
-          packet.setRange(28, 28 + len, jpeg, i);
-          udp.send(packet, dest, 5000);
-        }
-      }
     } catch (e) {
       mainSendPort.send("DEBUG: Error: $e");
     } finally {
-      // ------------------------
-      // Unlock UI processing
-      // ------------------------
       mainSendPort.send("UNLOCK");
     }
   }
@@ -342,10 +356,10 @@ class DecodeResult {
   final List<Rect> boxes;
   final List<double> confidences;
   final List<_Det> rawDets; // This is the 640x640 raw data for cropping
-  DecodeResult(this.boxes, this.confidences, this.rawDets);
+  final Size previewSize;
+  DecodeResult(this.boxes, this.confidences, this.rawDets, this.previewSize);
 }
 
-// Update the function signature
 DecodeResult _decodeYOLOWithConfFixed(
   SendPort mainSendPort,
   List output,
@@ -383,15 +397,16 @@ DecodeResult _decodeYOLOWithConfFixed(
   for (var d in nmsDets) {
     double width  = d.w * previewW;
     double height = d.h * previewH;
-    double top    = d.y * previewH;
+    double top    = previewH - height - height;
 
     // Convert right-side reference to left
-    double left = previewW - d.x - width;
+    double left =  previewW - width - width;
 
-    // Mirror for front camera
-    if (isFront) {
-      left = previewW - left;
-    }
+    // using the main camera where front is selfie camera !front is main back camera.
+    //if (!isFront) {
+    //  top  = previewH - height - height;
+    //  left =  previewW - width - width;
+    //}
 
     uiBoxes.add(Rect.fromLTWH(left, top, width, height));
     uiConfs.add(d.s);
@@ -406,7 +421,7 @@ DecodeResult _decodeYOLOWithConfFixed(
         : "DEBUG: first box UI coords: none"
   );
 
-  return DecodeResult(uiBoxes, uiConfs, nmsDets);
+  return DecodeResult(uiBoxes, uiConfs, nmsDets, previewSize);
 }
 
 //-----------------------------------------------------
@@ -450,6 +465,7 @@ class _UplinkScreenState extends State<UplinkScreen> {
 
 Future<void> _init() async {
   try {
+    await _requestPermissions();
     final cameras = await availableCameras();
     final front = cameras.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.front);
@@ -509,7 +525,7 @@ Future<void> _init() async {
   }
 }
 
-  @override
+   @override
   Widget build(BuildContext context) {
     if (_controller == null || !_controller!.value.isInitialized) {
       return const Scaffold(
@@ -747,6 +763,21 @@ Future<void> _toggleCamera() async {
         child: Icon(icon, color: Colors.cyanAccent),
       ),
     );
+  }
+}
+
+Future<void> _requestPermissions() async {
+  // Request both Camera and Location simultaneously
+  Map<Permission, PermissionStatus> statuses = await [
+    Permission.camera,
+    Permission.location,
+  ].request();
+
+  if (statuses[Permission.camera]!.isDenied || 
+      statuses[Permission.location]!.isDenied) {
+      if (statuses[Permission.camera]!.isPermanentlyDenied) {
+        openAppSettings(); // Takes user to Android settings to manually enable
+      }
   }
 }
 
