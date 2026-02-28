@@ -25,7 +25,8 @@ class MediaCommand {
   final bool isFront;
   final double lat, lon;
   final double previewW, previewH;  // Camera preview size
-  MediaCommand(this.rgbBytes, this.rawDets, this.isFront, this.lat, this.lon, this.previewW, this.previewH);
+  final List<List<double>> landmarks;
+  MediaCommand(this.rgbBytes, this.rawDets, this.isFront, this.lat, this.lon, this.previewW, this.previewH, this.landmarks);
 }
 
 class WorkerCommand {
@@ -201,27 +202,63 @@ void mediaProcessingWorker(SendPort mainSendPort) async {
       if (hasFacesInChunk) {
         final jpeg = Uint8List.fromList(img.encodeJpg(mosaic, quality: 30));
         globalFrameCounter++;
+
+      // Calculate the end boundary safely
+      int end = (chunkStart + 16 > msg.landmarks.length) 
+          ? msg.landmarks.length 
+          : chunkStart + 16;
+
+      final chunkedLandmarks = msg.landmarks.sublist(chunkStart, end);
         
         // Chunk the JPEG into UDP packets
-        _streamUdp(udp, jpeg, dest, globalFrameCounter, msg.lat, msg.lon);
+        _streamUdp(udp, jpeg, dest, globalFrameCounter, msg.lat, msg.lon, chunkedLandmarks);
       }
     }
   }
 }
 
-void _streamUdp(RawDatagramSocket? udp, Uint8List jpeg, InternetAddress dest, int frameId, double lat, double lon) {
+void _streamUdp(
+  RawDatagramSocket? udp, 
+  Uint8List jpeg, 
+  InternetAddress dest, 
+  int frameId, 
+  double lat, 
+  double lon, 
+  List<List<double>> landmarks
+) {
+  // 1. Calculate size for landmarks: Each double is 8 bytes.
+  // totalLandmarkDoubles = number of faces * landmarks per face
+  int landmarkCount = 0;
+  for (var face in landmarks) {landmarkCount += face.length;}
+  final int landmarkByteSize = landmarkCount * 8;
+
   for (int i = 0; i < jpeg.length; i += 1100) {
     final len = (i + 1100 < jpeg.length) ? 1100 : jpeg.length - i;
-    final packet = Uint8List(28 + len);
+    
+    // Header (28) + Landmark Data + JPEG Chunk
+    final packet = Uint8List(32 + landmarkByteSize + len);
     final view = ByteData.view(packet.buffer);
 
+    // Standard Header
     view.setUint32(0, frameId, Endian.big);
     view.setUint32(4, i, Endian.big);
     view.setUint32(8, jpeg.length, Endian.big);
     view.setFloat64(12, lat, Endian.big);
     view.setFloat64(20, lon, Endian.big);
+    view.setUint32(28, landmarkCount, Endian.big);
 
-    packet.setRange(28, 28 + len, jpeg, i);
+    // 2. Write Landmarks starting at offset 28
+    int currentOffset = 32;
+    for (var face in landmarks) {
+      for (var point in face) {
+        view.setFloat64(currentOffset, point, Endian.big);
+        currentOffset += 8;
+      }
+    }
+
+    // 3. Append JPEG data after landmarks
+    packet.setRange(currentOffset, currentOffset + len, jpeg, i);
+    
     udp?.send(packet, dest, 5000);
   }
 }
@@ -281,6 +318,7 @@ void backgroundInferenceWorker(SendPort mainSendPort) async {
           msg.longitude,
           msg.previewH,
           msg.previewW,
+          decoded.landmarks,
         ));
       }
 
@@ -357,7 +395,8 @@ class DecodeResult {
   final List<double> confidences;
   final List<_Det> rawDets; // This is the 640x640 raw data for cropping
   final Size previewSize;
-  DecodeResult(this.boxes, this.confidences, this.rawDets, this.previewSize);
+  final List<List<double>> landmarks;
+  DecodeResult(this.boxes, this.confidences, this.rawDets, this.previewSize, this.landmarks);
 }
 
 DecodeResult _decodeYOLOWithConfFixed(
@@ -372,8 +411,9 @@ DecodeResult _decodeYOLOWithConfFixed(
 ) {
   final dets = <_Det>[];
   final matrix = output[0];
+  final List<List<double>> landmarks = [];
 
-  // Parse detections
+   // Parse detections
   for (int i = 0; i < numAnchors; i++) {
     double conf = matrix[4][i].toDouble();
     if (conf < 0.25) continue;
@@ -382,8 +422,15 @@ DecodeResult _decodeYOLOWithConfFixed(
     double cy = matrix[1][i].toDouble(); // fraction
     double w  = matrix[2][i].toDouble(); // fraction
     double h  = matrix[3][i].toDouble(); // fraction
-
+   
     dets.add(_Det(cx, cy, w, h, conf));
+
+    // LANDMARKS: Create a unique list for THIS specific face
+    final List<double> faceLandmarks = [];
+    for (int j = 5; j < 20; j++) {
+      faceLandmarks.add(matrix[j][i].toDouble());
+    }
+    landmarks.add(faceLandmarks);
   }
 
   final nmsDets = _nms(dets, 0.25);
@@ -403,10 +450,6 @@ DecodeResult _decodeYOLOWithConfFixed(
     double left =  previewW - width - width;
 
     // using the main camera where front is selfie camera !front is main back camera.
-    //if (!isFront) {
-    //  top  = previewH - height - height;
-    //  left =  previewW - width - width;
-    //}
 
     uiBoxes.add(Rect.fromLTWH(left, top, width, height));
     uiConfs.add(d.s);
@@ -421,7 +464,7 @@ DecodeResult _decodeYOLOWithConfFixed(
         : "DEBUG: first box UI coords: none"
   );
 
-  return DecodeResult(uiBoxes, uiConfs, nmsDets, previewSize);
+  return DecodeResult(uiBoxes, uiConfs, nmsDets, previewSize, landmarks);
 }
 
 //-----------------------------------------------------

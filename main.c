@@ -9,18 +9,23 @@
 #include "server_pipe.h"  // your CUDA/GL pipeline
 #include <jpeglib.h>
 #include <setjmp.h>
+#include <time.h>
 
 #define UDP_PORT    5000
-#define CHUNK_SIZE  1200
+#define CHUNK_SIZE  1100
 
 volatile sig_atomic_t keep_running = 1;
-
-
 
 typedef struct {
     struct jpeg_error_mgr pub;
     jmp_buf setjmp_buffer;
 } jpeg_error_mgr_ext;
+
+// Extended error manager to prevent libjpeg from killing the server process on error
+struct my_error_mgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
 
 static void jpeg_error_exit(j_common_ptr cinfo) {
     jpeg_error_mgr_ext *err = (jpeg_error_mgr_ext *) cinfo->err;
@@ -31,22 +36,103 @@ static void jpeg_error_exit(j_common_ptr cinfo) {
 double ntohd(const uint8_t* buf) {
     uint64_t temp;
     memcpy(&temp, buf, 8);
-    
-    // Swap bytes: 01234567 -> 76543210
-    //temp = ((temp & 0xFF00000000000000ULL) >> 56) |
-    //       ((temp & 0x00FF000000000000ULL) >> 48) |
-    //       ((temp & 0x0000FF0000000000ULL) >> 40) |
-    //       ((temp & 0x000000FF00000000ULL) >> 32) |
-    //       ((temp & 0x00000000FF000000ULL) >> 24) |
-    //       ((temp & 0x0000000000FF0000ULL) >> 16) |
-    //       ((temp & 0x000000000000FF00ULL) >> 8)  |
-    //       ((temp & 0x00000000000000FFULL));
-
     temp = __builtin_bswap64(temp);
-           
     double result;
     memcpy(&result, &temp, 8);
     return result;
+}
+
+
+
+static void my_error_exit(j_common_ptr cinfo) {
+    struct my_error_mgr *myerr = (struct my_error_mgr *)cinfo->err;
+    (*cinfo->err->output_message)(cinfo);
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+void save_mosaic_with_metadata(uint8_t* bgr_pixels, int w, int h, double* landmarks, int landmark_count) {
+    if (!bgr_pixels || w <= 0 || h <= 0) return;
+
+    struct jpeg_compress_struct cinfo;
+    struct my_error_mgr jerr;
+    FILE *outfile = NULL;
+    char *meta_str = NULL;
+    char filename[128];
+
+    // 1. Precise Filename Generation
+    // Using %ld for time_t and %04x for hex random to ensure uniqueness/sorting
+    snprintf(filename, sizeof(filename), "mosaic_%ld_%04x.jpg", (long)time(NULL), rand() & 0xFFFF);
+
+    // 2. Setup libjpeg Error Handling
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = my_error_exit;
+    if (setjmp(jerr.setjmp_buffer)) {
+        // If we reach here, libjpeg hit an error
+        if (outfile) fclose(outfile);
+        if (meta_str) free(meta_str);
+        jpeg_destroy_compress(&cinfo);
+        fprintf(stderr, "Critical: libjpeg compression error for %s\n", filename);
+        return;
+    }
+
+    // 3. Robust String Serialization (The snprintf trick)
+    if (landmark_count > 0 && landmarks != NULL) {
+        // First pass: Calculate required buffer size exactly
+        int needed = 0;
+        for (int i = 0; i < landmark_count; i++) {
+            needed += snprintf(NULL, 0, "%.4f%s", landmarks[i], (i == landmark_count - 1) ? "" : ",");
+        }
+
+        // JPEG COM markers are limited to 65,533 bytes
+        if (needed < 65530) {
+            meta_str = (char*)malloc(needed + 1);
+            if (meta_str) {
+                int pos = 0;
+                for (int i = 0; i < landmark_count; i++) {
+                    pos += sprintf(meta_str + pos, "%.4f%s", landmarks[i], (i == landmark_count - 1) ? "" : ",");
+                }
+            }
+        }
+    }
+
+    // 4. Initialization & Compression
+    jpeg_create_compress(&cinfo);
+    if ((outfile = fopen(filename, "wb")) == NULL) {
+        if (meta_str) free(meta_str);
+        jpeg_destroy_compress(&cinfo);
+        return;
+    }
+
+    jpeg_stdio_dest(&cinfo, outfile);
+
+    cinfo.image_width = w;
+    cinfo.image_height = h;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_EXT_BGR; // Standard in libjpeg-turbo
+
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, 90, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    // 5. Inject Metadata
+    if (meta_str) {
+        jpeg_write_marker(&cinfo, JPEG_COM, (const JOCTET*)meta_str, strlen(meta_str));
+    }
+
+    // 6. Memory-Efficient Row Writing
+    int row_stride = w * 3;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        JSAMPROW row_pointer = &bgr_pixels[cinfo.next_scanline * row_stride];
+        jpeg_write_scanlines(&cinfo, &row_pointer, 1);
+    }
+
+    // 7. Cleanup
+    jpeg_finish_compress(&cinfo);
+    fclose(outfile);
+    jpeg_destroy_compress(&cinfo);
+    if (meta_str) free(meta_str);
+
+    printf("SUCCESS: %s [%d landmarks]\n", filename, landmark_count);
 }
 
 /*
@@ -143,7 +229,7 @@ void handle_sigint(int sig) { keep_running = 0; }
 
 int main(int argc, char** argv) {
     const char* engine_path = "model.engine";
-    int W = 640, H = 480;
+    int W = 640, H = 640;
     if (argc > 1) engine_path = argv[1];
 
     // ---------------- Initialize pipeline ----------------
@@ -187,49 +273,62 @@ int main(int argc, char** argv) {
 
     // ---------------- Main loop ----------------
     while (keep_running) {
-        // 1. Buffer must accommodate the 28-byte header + 1200-byte payload
-        unsigned char buf[28 + CHUNK_SIZE]; 
+        // 1. Max packet size: Header(32) + MaxLandmarks(16*15*8) + Chunk(1100)
+        // 3000 bytes is a safe buffer for jumbo/normal frames
+        unsigned char buf[4096]; 
         int n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr*)&client, &client_len);
         
-        // 2. Minimum packet size check (Header is 28 bytes)
-        if (n < 28) continue; 
+        if (n < 32) continue; // Minimum header size now 32
 
-        uint32_t frame_id   = ntohl(*(uint32_t*)(buf + 0));
-        uint32_t offset     = ntohl(*(uint32_t*)(buf + 4));
-        uint32_t total_size = ntohl(*(uint32_t*)(buf + 8));
-        double latitude     = ntohd(buf + 12);
-        double longitude    = ntohd(buf + 20);
+        // --- Parse Fixed Header ---
+        uint32_t frame_id       = ntohl(*(uint32_t*)(buf + 0));
+        uint32_t jpeg_offset    = ntohl(*(uint32_t*)(buf + 4));
+        uint32_t jpeg_total_sz  = ntohl(*(uint32_t*)(buf + 8));
+        double latitude         = ntohd(buf + 12);
+        double longitude        = ntohd(buf + 20);
+        uint32_t landmark_count = ntohl(*(uint32_t*)(buf + 28));
 
-        // Payload size is total packet size minus the header
-        uint32_t chunk_size = n - 28;
+        // --- Calculate Dynamic Offsets ---
+        uint32_t landmark_bytes = landmark_count * 8;
+        uint32_t header_total   = 32 + landmark_bytes;
+        uint32_t chunk_size     = n - header_total;
 
-        // Reset buffer if a new frame starts (Simple reassembly)
+        // --- Reassemble JPEG ---
         if (frame_id > current_frame) {
             bytes_received = 0;
             current_frame = frame_id;
         }
 
-        // 3. Use the 28-byte offset to find the start of the JPEG data
-        if (offset + chunk_size <= FRAME_SIZE) {
-            memcpy(frame_buffer + offset, buf + 28, chunk_size);
+        // Ensure we don't overflow the reassembly buffer
+        if (jpeg_offset + chunk_size <= FRAME_SIZE) {
+            // Copy JPEG data starting after the landmarks
+            memcpy(frame_buffer + jpeg_offset, buf + header_total, chunk_size);
             bytes_received += chunk_size;
         }
 
-        // 4. Frame complete check
-        if (bytes_received >= total_size && total_size > 0) {
+        // --- Process Completed Frame ---
+        if (jpeg_offset + chunk_size == jpeg_total_sz && bytes_received >= jpeg_total_sz) {
             int outW, outH, outC;
-            
-            // Pass the assembled frame_buffer (containing the full JPEG) to the decoder
-            uint8_t* bgr_pixels = jpeg_to_bgr(frame_buffer, total_size, &outW, &outH, &outC);
+            uint8_t* bgr_pixels = jpeg_to_bgr(frame_buffer, jpeg_total_sz, &outW, &outH, &outC);
             
             if (bgr_pixels) {
-                // Log telemetry before processing
-                printf("FRAME: %u | LAT: %f | LON: %f | SIZE: %u\n", current_frame, latitude, longitude, total_size);
+                // 1. Extract landmarks from the current packet's buffer
+                // (Note: In a production environment, you'd store these during reassembly 
+                // if landmarks differ across packets, but usually they are redundant per frame)
+                double* landmarks_to_save = (double*)malloc(landmark_count * sizeof(double));
+                for(uint32_t l = 0; l < landmark_count; l++) {
+                    landmarks_to_save[l] = ntohd(buf + 32 + (l * 8));
+                }
+
+                // 2. Save image and metadata
+                save_mosaic_with_metadata(bgr_pixels, outW, outH, landmarks_to_save, landmark_count);
                 
+                // 3. Process for CUDA/GL pipeline
                 server_process_frame(bgr_pixels, outW * outH * outC);
+                
+                free(landmarks_to_save);
                 free(bgr_pixels); 
             }
-            
             bytes_received = 0;
         }
     }
