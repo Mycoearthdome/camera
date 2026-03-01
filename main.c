@@ -10,6 +10,8 @@
 #include <jpeglib.h>
 #include <setjmp.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define UDP_PORT    5000
 #define CHUNK_SIZE  1100
@@ -57,33 +59,40 @@ void save_mosaic_with_metadata(uint8_t* bgr_pixels, int w, int h, double* landma
     struct my_error_mgr jerr;
     FILE *outfile = NULL;
     char *meta_str = NULL;
-    char filename[128];
+    char path[256];
+    const char *folder = "pictures";
 
-    // 1. Precise Filename Generation
-    // Using %ld for time_t and %04x for hex random to ensure uniqueness/sorting
-    snprintf(filename, sizeof(filename), "mosaic_%ld_%04x.jpg", (long)time(NULL), rand() & 0xFFFF);
+    // 1. Create directory if it doesn't exist
+    // 0777 sets read/write/execute permissions for all users (modified by umask)
+    if (mkdir(folder, 0777) == -1) {
+        if (errno != EEXIST) {
+            fprintf(stderr, "Error creating directory %s\n", folder);
+            return;
+        }
+    }
 
-    // 2. Setup libjpeg Error Handling
+    // 2. Precise Path Generation
+    // Including the folder name in the snprintf path
+    snprintf(path, sizeof(path), "%s/mosaic_%ld_%04x.jpg", folder, (long)time(NULL), rand() & 0xFFFF);
+
+    // 3. Setup libjpeg Error Handling
     cinfo.err = jpeg_std_error(&jerr.pub);
     jerr.pub.error_exit = my_error_exit;
     if (setjmp(jerr.setjmp_buffer)) {
-        // If we reach here, libjpeg hit an error
         if (outfile) fclose(outfile);
         if (meta_str) free(meta_str);
         jpeg_destroy_compress(&cinfo);
-        fprintf(stderr, "Critical: libjpeg compression error for %s\n", filename);
+        fprintf(stderr, "Critical: libjpeg compression error for %s\n", path);
         return;
     }
 
-    // 3. Robust String Serialization (The snprintf trick)
+    // 4. Robust String Serialization
     if (landmark_count > 0 && landmarks != NULL) {
-        // First pass: Calculate required buffer size exactly
         int needed = 0;
         for (int i = 0; i < landmark_count; i++) {
             needed += snprintf(NULL, 0, "%.4f%s", landmarks[i], (i == landmark_count - 1) ? "" : ",");
         }
 
-        // JPEG COM markers are limited to 65,533 bytes
         if (needed < 65530) {
             meta_str = (char*)malloc(needed + 1);
             if (meta_str) {
@@ -95,9 +104,10 @@ void save_mosaic_with_metadata(uint8_t* bgr_pixels, int w, int h, double* landma
         }
     }
 
-    // 4. Initialization & Compression
+    // 5. Initialization & Compression
     jpeg_create_compress(&cinfo);
-    if ((outfile = fopen(filename, "wb")) == NULL) {
+    if ((outfile = fopen(path, "wb")) == NULL) {
+        fprintf(stderr, "Error opening output file %s\n", path);
         if (meta_str) free(meta_str);
         jpeg_destroy_compress(&cinfo);
         return;
@@ -108,31 +118,31 @@ void save_mosaic_with_metadata(uint8_t* bgr_pixels, int w, int h, double* landma
     cinfo.image_width = w;
     cinfo.image_height = h;
     cinfo.input_components = 3;
-    cinfo.in_color_space = JCS_EXT_BGR; // Standard in libjpeg-turbo
+    cinfo.in_color_space = JCS_EXT_BGR; 
 
     jpeg_set_defaults(&cinfo);
     jpeg_set_quality(&cinfo, 90, TRUE);
     jpeg_start_compress(&cinfo, TRUE);
 
-    // 5. Inject Metadata
+    // 6. Inject Metadata
     if (meta_str) {
         jpeg_write_marker(&cinfo, JPEG_COM, (const JOCTET*)meta_str, strlen(meta_str));
     }
 
-    // 6. Memory-Efficient Row Writing
+    // 7. Memory-Efficient Row Writing
     int row_stride = w * 3;
     while (cinfo.next_scanline < cinfo.image_height) {
         JSAMPROW row_pointer = &bgr_pixels[cinfo.next_scanline * row_stride];
         jpeg_write_scanlines(&cinfo, &row_pointer, 1);
     }
 
-    // 7. Cleanup
+    // 8. Cleanup
     jpeg_finish_compress(&cinfo);
     fclose(outfile);
     jpeg_destroy_compress(&cinfo);
     if (meta_str) free(meta_str);
 
-    printf("SUCCESS: %s [%d landmarks]\n", filename, landmark_count);
+    printf("SUCCESS: Saved to %s [%d landmarks]\n", path, landmark_count);
 }
 
 /*

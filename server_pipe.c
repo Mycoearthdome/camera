@@ -392,6 +392,55 @@ int server_init(const char* engine_path, int width, int height)
     return 0;
 }
 
+/*
+
+int server_process_frame(unsigned char* host_frame, int size)
+{
+    if (!host_frame || size != PIXELS * 3) return -1;
+    int next = 1 - cur;
+
+    if (!eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) return -1;
+
+    // 1. Copy the Mosaic JPEG (now BGR pixels) to the GPU
+    CUDA_CHECK(cudaMemcpyAsync(d_bgr[next], host_frame, size, cudaMemcpyHostToDevice, stream));
+
+    // 2. Map the OpenGL Texture for writing
+    CUDA_CHECK(cudaGraphicsMapResources(1, &cuda_tex, stream));
+    cudaArray_t array;
+    CUDA_CHECK(cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex, 0, 0));
+
+    cudaResourceDesc desc = {};
+    desc.resType = cudaResourceTypeArray;
+    desc.res.array.array = array;
+    cudaSurfaceObject_t surf = 0;
+    CUDA_CHECK(cudaCreateSurfaceObject(&surf, &desc));
+
+    dim3 block(16,16);
+    dim3 grid((W + 15) / 16, (H + 15) / 16);
+
+    // 3. ONLY run the conversion kernel to move BGR to the GL Surface
+    // Comment out the TensorRT logic entirely!
+    bgr_to_surface_and_nchw<<<grid, block, 0, stream>>>(d_bgr[next], surf, d_trt[next], W, H, PIXELS);
+
+    /* KEEP TENSORRT DISABLED HERE 
+       If you run context->enqueueV3(stream), it will process your 
+       mosaic as a single face and corrupt the visual output.
+    
+
+    // 4. Cleanup and Render
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaDestroySurfaceObject(surf);
+    CUDA_CHECK(cudaGraphicsUnmapResources(1, &cuda_tex, stream));
+
+    // Standard OpenGL draw calls (already in your server_pipe.c)
+    // ... glBegin(GL_QUADS) ... 
+    
+    eglSwapBuffers(eglDisplay, eglSurface);
+    cur = next;
+    return 0;
+}*/
+
+
 // ============================================================
 // server_process_frame with test pattern
 // ============================================================
@@ -441,14 +490,11 @@ int server_process_frame(unsigned char* host_frame, int size)
     // --- 2. Reverse Kernel: float NCHW -> RGBA Surface ---
     // Launch a new kernel to take the AI output and write it back to the OpenGL surface
     // (Assuming d_out[next] is a float* of size PIXELS * 3)
-    nchw_to_surface<<<grid, block, 0, stream>>>(
-        (float*)d_out[next], surf, W, H, PIXELS);
+    //nchw_to_surface<<<grid, block, 0, stream>>>(
+    //    (float*)d_out[next], surf, W, H, PIXELS);
 
-    //nchw_to_surface<<<grid, block, 0, stream>>>( //DEBUG
-    //    (float*)d_trt[next], surf, W, H, PIXELS); //DEBUG
-
-
-
+    nchw_to_surface<<<grid, block, 0, stream>>>( //DEBUG
+        (float*)d_trt[next], surf, W, H, PIXELS); //DEBUG
 
     // 3. Cleanup CUDA Surface
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -486,49 +532,12 @@ int server_process_frame(unsigned char* host_frame, int size)
 
     // 5. Swap
     if (!eglSwapBuffers(eglDisplay, eglSurface))
-        printf("eglSwapBuffers failed!\n");
-
-
-    /*
-    // ----------------------------
-    // Training export
-    // ----------------------------
-    if (!train_file) {
-        train_file = fopen("/dev/shm/nn_frames.bin", "wb");
-        if (!train_file) {
-            fprintf(stderr, "Failed to open training file\n");
-        }
-    }
-
-    if (train_file) {
-        if (!host_float) {
-            host_float = (float*)malloc(PIXELS * CHANNELS * sizeof(float));
-            if (!host_float) {
-                fprintf(stderr, "Failed to allocate host_float\n");
-            }
-        }
-
-        if (host_float) {
-            // Copy from NCHW float buffer (d_trt[next])
-            CUDA_CHECK(cudaMemcpyAsync(
-                host_float,
-                d_trt[next],
-                PIXELS * CHANNELS * sizeof(float),
-                cudaMemcpyDeviceToHost,
-                stream));
-
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-
-            fwrite(host_float, sizeof(float), PIXELS * CHANNELS, train_file);
-            fflush(train_file);
-        }
-    }
-    */
-    
+        printf("eglSwapBuffers failed!\n"); 
     
     cur = next;
     return 0;
 }
+
 
 void server_cleanup()
 {

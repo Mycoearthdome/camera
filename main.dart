@@ -25,8 +25,8 @@ class MediaCommand {
   final bool isFront;
   final double lat, lon;
   final double previewW, previewH;  // Camera preview size
-  final List<List<double>> landmarks;
-  MediaCommand(this.rgbBytes, this.rawDets, this.isFront, this.lat, this.lon, this.previewW, this.previewH, this.landmarks);
+  final List<List<List<double>>> totallandmarks;
+  MediaCommand(this.rgbBytes, this.rawDets, this.isFront, this.lat, this.lon, this.previewW, this.previewH, this.totallandmarks);
 }
 
 class WorkerCommand {
@@ -146,72 +146,79 @@ void mediaProcessingWorker(SendPort mainSendPort) async {
       numChannels: 3,
     );
 
-    // 2. Iterate through all detections in steps of 16
-    for (int chunkStart = 0; chunkStart < msg.rawDets.length; chunkStart += 16) {
-      final mosaic = img.Image(
-        width: 640, 
-        height: 640, 
-        backgroundColor: img.ColorRgb8(0, 0, 0)
-      );
+    for (int landmarksindex = 0; landmarksindex < msg.totallandmarks.length;landmarksindex++){
+      // 2. Iterate through all detections in steps of 16
+      for (int chunkStart = 0; chunkStart < msg.rawDets.length; chunkStart += 16) {
+        final mosaic = img.Image(
+          width: 640, 
+          height: 640, 
+          backgroundColor: img.ColorRgb8(0, 0, 0)
+        );
 
-      bool hasFacesInChunk = false;
+        bool hasFacesInChunk = false;
 
-      // Fill the 4x4 grid (16 slots)
-      for (int i = 0; i < 16 && (chunkStart + i) < msg.rawDets.length; i++) {
-        hasFacesInChunk = true;
-        final d = msg.rawDets[chunkStart + i];
-        final previewW = msg.previewW;
-        final previewH = msg.previewH;
+        // Fill the 4x4 grid (16 slots)
+        for (int i = 0; i < 16 && (chunkStart + i) < msg.rawDets.length; i++) {
+          hasFacesInChunk = true;
+          final d = msg.rawDets[chunkStart + i];
+          final previewW = msg.previewW;
+          final previewH = msg.previewH;
 
-        double width  = d.w * previewW;
-        double height = d.h * previewH;
-        double top    = d.y * previewH;
+          double width  = d.w * previewW;
+          double height = d.h * previewH;
+          double top    = d.y * previewH;
 
-        // Convert right-side reference to left
-        double left = previewW - d.x - width;
+          // Convert right-side reference to left
+          double left = previewW - d.x - width;
 
-        // Mirror for front camera
-        if (msg.isFront) {
-          left = previewW - left;
+          // Mirror for front camera
+          if (msg.isFront) {
+            left = previewW - left;
+          }
+
+          // Crop directly using model-space coordinates (0-640)
+          var tile = img.copyCrop(
+            fullFrame,
+            x: left.toInt().clamp(0, 639),
+            y: top.toInt().clamp(0, 639),
+            width: width.toInt().clamp(1, 640),
+            height: height.toInt().clamp(1, 640),
+          );
+
+          // Fast resize and orientation fix
+          tile = img.copyResize(tile, width: 160, height: 160, interpolation: img.Interpolation.nearest);
+          tile = img.copyRotate(tile, angle: msg.isFront ? 270 : 90); //270 : 90
+          if (msg.isFront) tile = img.flipHorizontal(tile);
+
+          // Composite into the 4x4 mosaic grid
+          img.compositeImage(
+            mosaic,
+            tile,
+            dstX: (i % 4) * 160,
+            dstY: (i ~/ 4) * 160,
+          );
         }
 
-        // Crop directly using model-space coordinates (0-640)
-        var tile = img.copyCrop(
-          fullFrame,
-          x: left.toInt().clamp(0, 639),
-          y: top.toInt().clamp(0, 639),
-          width: width.toInt().clamp(1, 640),
-          height: height.toInt().clamp(1, 640),
-        );
+        // 3. Encode and Stream via UDP if we have data
+        if (hasFacesInChunk) {
+          final jpeg = Uint8List.fromList(img.encodeJpg(mosaic, quality: 30));
+          globalFrameCounter++;
 
-        // Fast resize and orientation fix
-        tile = img.copyResize(tile, width: 160, height: 160, interpolation: img.Interpolation.nearest);
-        tile = img.copyRotate(tile, angle: msg.isFront ? 270 : 90); //270 : 90
-        if (msg.isFront) tile = img.flipHorizontal(tile);
-
-        // Composite into the 4x4 mosaic grid
-        img.compositeImage(
-          mosaic,
-          tile,
-          dstX: (i % 4) * 160,
-          dstY: (i ~/ 4) * 160,
-        );
-      }
-
-      // 3. Encode and Stream via UDP if we have data
-      if (hasFacesInChunk) {
-        final jpeg = Uint8List.fromList(img.encodeJpg(mosaic, quality: 30));
-        globalFrameCounter++;
-
-      // Calculate the end boundary safely
-      int end = (chunkStart + 16 > msg.landmarks.length) 
-          ? msg.landmarks.length 
-          : chunkStart + 16;
-
-      final chunkedLandmarks = msg.landmarks.sublist(chunkStart, end);
-        
+        int end;
+        List<List<double>> chunkedLandmarks = [];
+        for (int faceindex = 0; faceindex <  msg.totallandmarks[landmarksindex].length; faceindex++){
+          List<double> faceslandmarks = [];
+            end = (chunkStart + 16 > msg.totallandmarks[landmarksindex][faceindex].length) 
+              ? msg.totallandmarks[landmarksindex][faceindex].length 
+              : chunkStart + 16;
+            faceslandmarks = msg.totallandmarks[landmarksindex][faceindex].sublist(chunkStart, end);
+            faceslandmarks.add(0.0000); // between faces landmark marker
+            chunkedLandmarks.add(faceslandmarks);
+        }
+          
         // Chunk the JPEG into UDP packets
         _streamUdp(udp, jpeg, dest, globalFrameCounter, msg.lat, msg.lon, chunkedLandmarks);
+        }
       }
     }
   }
@@ -318,7 +325,7 @@ void backgroundInferenceWorker(SendPort mainSendPort) async {
           msg.longitude,
           msg.previewH,
           msg.previewW,
-          decoded.landmarks,
+          decoded.totallandmarks,
         ));
       }
 
@@ -395,8 +402,8 @@ class DecodeResult {
   final List<double> confidences;
   final List<_Det> rawDets; // This is the 640x640 raw data for cropping
   final Size previewSize;
-  final List<List<double>> landmarks;
-  DecodeResult(this.boxes, this.confidences, this.rawDets, this.previewSize, this.landmarks);
+  final List<List<List<double>>> totallandmarks;
+  DecodeResult(this.boxes, this.confidences, this.rawDets, this.previewSize, this.totallandmarks);
 }
 
 DecodeResult _decodeYOLOWithConfFixed(
@@ -411,10 +418,12 @@ DecodeResult _decodeYOLOWithConfFixed(
 ) {
   final dets = <_Det>[];
   final matrix = output[0];
-  final List<List<double>> landmarks = [];
+  final List<List<List<double>>> totallandmarks = [];
+  
 
    // Parse detections
   for (int i = 0; i < numAnchors; i++) {
+    final List<List<double>> landmarks = [];
     double conf = matrix[4][i].toDouble();
     if (conf < 0.25) continue;
 
@@ -431,6 +440,7 @@ DecodeResult _decodeYOLOWithConfFixed(
       faceLandmarks.add(matrix[j][i].toDouble());
     }
     landmarks.add(faceLandmarks);
+    totallandmarks.add(landmarks);
   }
 
   final nmsDets = _nms(dets, 0.25);
@@ -464,7 +474,7 @@ DecodeResult _decodeYOLOWithConfFixed(
         : "DEBUG: first box UI coords: none"
   );
 
-  return DecodeResult(uiBoxes, uiConfs, nmsDets, previewSize, landmarks);
+  return DecodeResult(uiBoxes, uiConfs, nmsDets, previewSize, totallandmarks);
 }
 
 //-----------------------------------------------------
